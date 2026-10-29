@@ -12,7 +12,7 @@ def test_defaults(tmp_path):
     """load_settings on a missing file returns defaults and creates the file."""
     p = tmp_path / "settings.json"
     s = load_settings(p)
-    assert s.provider.model == "deepseek-v4-flash"
+    assert s.provider.model == "deepseek-flash"
     assert s.provider.base_url == "https://api.deepseek.com"
     assert s.provider.thinking is True
     # Default is "low" (settings.py: ProviderSettings.reasoning_effort) —
@@ -60,7 +60,7 @@ def test_corrupt_json_returns_defaults(tmp_path):
     p = tmp_path / "settings.json"
     p.write_text("{not valid json", encoding="utf-8")
     s = load_settings(p)
-    assert s.provider.model == "deepseek-v4-flash"
+    assert s.provider.model == "deepseek-flash"
 
 
 def test_missing_api_key_leaves_api_key_blank(tmp_path):
