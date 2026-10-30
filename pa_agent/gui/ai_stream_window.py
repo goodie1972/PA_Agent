@@ -37,6 +37,7 @@ class _ChatWorker(QThread):
     error = pyqtSignal(str)
     reasoning_token = pyqtSignal(str)
     content_token = pyqtSignal(str)
+    progress = pyqtSignal(str)
 
     def __init__(
         self,
@@ -57,6 +58,7 @@ class _ChatWorker(QThread):
                 self._cancel_token,
                 on_reasoning_token=lambda c: self.reasoning_token.emit(c),
                 on_content_token=lambda c: self.content_token.emit(c),
+                on_progress=lambda t: self.progress.emit(t),
             )
             hit_pct = round(reply.usage.cache_hit_rate * 100, 1) if reply.usage else 0.0
             self.finished.emit(reply.content, reply.reasoning_content or "", hit_pct)
@@ -602,6 +604,7 @@ class AIStreamPanel(QWidget):
         self._worker.content_token.connect(
             lambda chunk: self._append_stream_text_for_stage("chat", chunk, kind="content")
         )
+        self._worker.progress.connect(self._on_chat_progress)
         self._worker.finished.connect(self._on_reply_done)
         self._worker.error.connect(self._on_reply_error)
         self._worker.finished.connect(lambda *_: self._on_worker_done())
@@ -628,6 +631,19 @@ class AIStreamPanel(QWidget):
     def _on_reply_error(self, msg: str) -> None:
         self._append_reasoning(f"\n[错误] {msg}\n")
         self._end_stage("追问（失败）")
+
+    def _on_chat_progress(self, text: str) -> None:
+        """Show the latest progress line on the phase label while a spare channel works.
+
+        Wording stays neutral (see the "备用通道" convention); the raw upstream
+        reason is only ever logged.
+        """
+        lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+        if not lines:
+            return
+        latest = lines[-1].replace("[提示]", "").strip()
+        if latest:
+            self._phase_label.setText(f"▶ 追问 — {latest}")
 
     def _on_worker_done(self) -> None:
         self._sending = False

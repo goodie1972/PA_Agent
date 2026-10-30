@@ -87,6 +87,7 @@ class _ChatWorker(QThread):
     error = pyqtSignal(str)
     reasoning_token = pyqtSignal(str)
     content_token = pyqtSignal(str)
+    progress = pyqtSignal(str)
 
     def __init__(
         self,
@@ -107,6 +108,7 @@ class _ChatWorker(QThread):
                 self._cancel_token,
                 on_reasoning_token=lambda chunk: self.reasoning_token.emit(chunk),
                 on_content_token=lambda chunk: self.content_token.emit(chunk),
+                on_progress=lambda text: self.progress.emit(text),
             )
             self.finished.emit(reply.content, reply.reasoning_content or "")
         except Exception as exc:  # noqa: BLE001
@@ -574,6 +576,9 @@ class ConversationWidget(QWidget):
         )
         self._worker.content_token.connect(
             lambda c: self._append_to_turn(self._chat_turn, content=c)
+        )
+        self._worker.progress.connect(
+            lambda text: self._append_to_turn(self._chat_turn, reasoning=text)
         )
         self._worker.finished.connect(self._on_reply_received)
         self._worker.error.connect(self._on_reply_error)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import json
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from pa_agent.ai.deepseek_client import DeepSeekClient
@@ -44,6 +44,29 @@ def _derive_record_id(record: AnalysisRecord) -> str:
 def _strip_reasoning(message: dict) -> dict:
     """Return a copy of *message* without the ``reasoning_content`` key."""
     return {k: v for k, v in message.items() if k != "reasoning_content"}
+
+
+def _accept_any_reply(reply: object) -> object:
+    """Free-chat has no JSON contract: any reply counts as a valid pass.
+
+    The two-stage pipeline validates stage JSON here; a follow-up answer is
+    plain prose, so the only thing worth rejecting is an empty reply (handled
+    by the caller after the call).
+    """
+    from pa_agent.ai.json_validator import Ok
+
+    return Ok({"content": getattr(reply, "content", "") or ""})
+
+
+def _progress(on_progress: "Callable[[str], None] | None", text: str) -> None:
+    """Best-effort progress line; a broken callback never breaks the answer."""
+    if on_progress is None:
+        return
+    try:
+        on_progress(text)
+    except Exception:  # noqa: BLE001
+        logger.debug("free-chat progress callback failed", exc_info=True)
+
 
 
 class FreeChatSession:
@@ -92,6 +115,13 @@ class FreeChatSession:
         self._ledger = ledger
         self._settings = settings
         self._kline_snapshot_fn = kline_snapshot_fn
+
+        # In-memory provider override once a layered fallback succeeded; never
+        # written back to settings.json.
+        self._active_provider: Any = None
+        #: Diagnostic marker: "free" / "provider" once a spare channel answered
+        #: this session, empty while the primary provider keeps working.
+        self.spare_channel_used: str = ""
 
         # Turn counter — incremented before each send so the first turn is 1.
         self._turn: int = 0
@@ -254,12 +284,222 @@ class FreeChatSession:
 
         return prefix
 
+    # ── Layered spare channels ────────────────────────────────────────────────
+
+    def _chat_with_spare_channels(
+        self,
+        messages: list[dict],
+        *,
+        cancel_token: CancelToken,
+        on_reasoning_token: "Callable[[str], None] | None",
+        on_content_token: "Callable[[str], None] | None",
+        reasoning_effort: str,
+        on_progress: "Callable[[str], None] | None" = None,
+    ) -> AIReply:
+        """Ask the primary provider, then the layered spare channels.
+
+        Layer 0 — spare channel (free pool): only for an eligible SenseNova
+                  primary, exactly like the two-stage pipeline.
+        Layer 1 — ``settings.provider.fallbacks`` (e.g. glm-4-flash), applied in
+                  memory only; settings.json is never rewritten.
+
+        A follow-up answer carries no JSON contract, so the free lane accepts
+        any non-empty prose instead of validating a stage schema. Cancellation
+        and interrupt errors always propagate untouched.
+        """
+        from pa_agent.ai.deepseek_client import CancelledError as _CancelledError
+        from pa_agent.ai.sensenova_fallback import is_cancel_or_interrupt as _is_cancel
+
+        primary_exc: BaseException | None = None
+        try:
+            return self._client.stream_chat(
+                messages,
+                on_reasoning_token=on_reasoning_token,
+                on_content_token=on_content_token,
+                cancel_token=cancel_token,
+                reasoning_effort=reasoning_effort,
+            )
+        except _CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            if _is_cancel(exc):
+                raise
+            primary_exc = exc
+
+        logger.warning(
+            "free-chat primary provider failed (%s); trying spare channels",
+            type(primary_exc).__name__,
+        )
+        _progress(
+            on_progress,
+            "[提示] 主通道暂时不可用，已自动切换备用通道继续回答。\n",
+        )
+
+        reply = self._try_free_pool(
+            messages,
+            cancel_token=cancel_token,
+            on_reasoning_token=on_reasoning_token,
+            on_content_token=on_content_token,
+            on_progress=on_progress,
+        )
+        if reply is not None:
+            return reply
+
+        reply = self._try_provider_fallback(
+            messages,
+            cancel_token=cancel_token,
+            on_reasoning_token=on_reasoning_token,
+            on_content_token=on_content_token,
+            on_progress=on_progress,
+        )
+        if reply is not None:
+            return reply
+
+        assert primary_exc is not None
+        raise primary_exc
+
+    def _try_free_pool(
+        self,
+        messages: list[dict],
+        *,
+        cancel_token: CancelToken,
+        on_reasoning_token: "Callable[[str], None] | None",
+        on_content_token: "Callable[[str], None] | None",
+        on_progress: "Callable[[str], None] | None",
+    ) -> AIReply | None:
+        """Layer 0: rotate the free pool and accept the first usable answer."""
+        if self._settings is None:
+            return None
+        provider = getattr(self._settings, "provider", None)
+        if provider is None:
+            return None
+
+        from pa_agent.ai.sensenova_fallback import (
+            FreeStageSuccess,
+            is_cancel_or_interrupt as _is_cancel,
+            is_sensenova_fallback_eligible,
+            run_free_stage_fallback,
+        )
+
+        if not is_sensenova_fallback_eligible(getattr(provider, "base_url", "") or ""):
+            return None
+
+        try:
+            outcome = run_free_stage_fallback(
+                messages=list(messages),
+                validate=_accept_any_reply,
+                primary_api_key=str(getattr(provider, "api_key", "") or ""),
+                cancel_token=cancel_token,
+                on_reasoning_token=on_reasoning_token,
+                on_content_token=on_content_token,
+                on_progress=on_progress,
+                stream=True,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            if _is_cancel(exc):
+                raise
+            logger.warning("free-chat spare-channel rotation failed: %s", exc)
+            return None
+
+        if isinstance(outcome, FreeStageSuccess):
+            reply = getattr(outcome, "reply", None)
+            if reply is not None and str(getattr(reply, "content", "") or "").strip():
+                self.spare_channel_used = "free"
+                logger.warning(
+                    "free-chat follow-up answered by spare channel: %s",
+                    getattr(getattr(outcome, "candidate", None), "model", "?"),
+                )
+                return reply
+        return None
+
+    def _try_provider_fallback(
+        self,
+        messages: list[dict],
+        *,
+        cancel_token: CancelToken,
+        on_reasoning_token: "Callable[[str], None] | None",
+        on_content_token: "Callable[[str], None] | None",
+        on_progress: "Callable[[str], None] | None",
+    ) -> AIReply | None:
+        """Layer 1: switch the in-memory provider to the configured fallbacks."""
+        if self._settings is None:
+            return None
+        provider = getattr(self._settings, "provider", None)
+        if provider is None:
+            return None
+
+        from pa_agent.ai.glm_backup import ensure_glm_fallback
+        from pa_agent.ai.sensenova_fallback import is_cancel_or_interrupt as _is_cancel
+
+        try:
+            ensure_glm_fallback(provider)
+        except Exception:  # noqa: BLE001
+            logger.debug("free-chat ensure_glm_fallback failed", exc_info=True)
+
+        chain = list(getattr(provider, "fallbacks", []) or [])
+        if not chain:
+            return None
+
+        current = self._active_provider if self._active_provider is not None else provider
+        tried: set[tuple[str, str]] = {
+            (
+                str(getattr(current, "base_url", "") or "").strip(),
+                str(getattr(current, "model", "") or "").strip(),
+            )
+        }
+        for cand in chain:
+            key = (
+                str(getattr(cand, "base_url", "") or "").strip(),
+                str(getattr(cand, "model", "") or "").strip(),
+            )
+            if key in tried:
+                continue
+            tried.add(key)
+            if not str(getattr(cand, "api_key", "") or "").strip():
+                logger.warning(
+                    "free-chat provider fallback skipped (empty api_key): model=%s",
+                    getattr(cand, "model", "?"),
+                )
+                continue
+            try:
+                self._client.update_provider(cand)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("free-chat provider fallback update failed: %s", exc)
+                continue
+            _progress(on_progress, "[提示] 备用通道仍在处理，请稍候。\n")
+            try:
+                reply = self._client.stream_chat(
+                    messages,
+                    on_reasoning_token=on_reasoning_token,
+                    on_content_token=on_content_token,
+                    cancel_token=cancel_token,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                if _is_cancel(exc):
+                    raise
+                logger.warning(
+                    "free-chat provider fallback failed: model=%s (%s)",
+                    getattr(cand, "model", "?"),
+                    exc,
+                )
+                continue
+            if reply is not None and str(getattr(reply, "content", "") or "").strip():
+                self._active_provider = cand
+                self.spare_channel_used = "provider"
+                logger.warning(
+                    "free-chat follow-up answered by provider fallback: model=%s",
+                    getattr(cand, "model", "?"),
+                )
+                return reply
+        return None
+
     def send(
         self,
         user_text: str,
         cancel_token: CancelToken,
         on_reasoning_token: "Callable[[str], None] | None" = None,
         on_content_token: "Callable[[str], None] | None" = None,
+        on_progress: "Callable[[str], None] | None" = None,
     ) -> AIReply:
         """Send *user_text* to the AI and return the reply.
 
@@ -353,14 +593,15 @@ class FreeChatSession:
             self._pending_writer.append_followup(self._record_id, cancelled_turn)
             raise CancelledError("FreeChatSession.send cancelled before API call")
 
-        # ── 4. Call the API (streaming) ───────────────────────────────────────
+        # ── 4. Call the API (streaming, layered spare channels) ───────────────
         try:
-            reply = self._client.stream_chat(
+            reply = self._chat_with_spare_channels(
                 history_for_api,
+                cancel_token=cancel_token,
                 on_reasoning_token=on_reasoning_token,
                 on_content_token=on_content_token,
-                cancel_token=cancel_token,
                 reasoning_effort=reasoning_effort,
+                on_progress=on_progress,
             )
         except CancelledError:
             # Persist a cancelled turn and re-raise
