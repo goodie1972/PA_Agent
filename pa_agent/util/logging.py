@@ -144,9 +144,9 @@ _QUIET_LOGGER_NAMES = (
     "urllib3",
     "openai",
     "httpx",
+    "httpcore",
     "tvDatafeed",
     "tvDatafeed.main",
-    "root",  # tvdatafeed uses logging.getLogger("root") for websocket
     "websocket",
 )
 

@@ -26,6 +26,7 @@ STAGE2_VALIDATION_AUTO_RETRY = False
 import copy
 import dataclasses
 import logging
+import os
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -53,6 +54,51 @@ def _latency_ms_label(latency_ms: object) -> str:
         return f"{float(latency_ms):.0f}ms"
     except (TypeError, ValueError):
         return "?"
+
+
+def _prompt_dump_enabled() -> bool:
+    """Full prompt/response dumps are opt-in via env var; otherwise only a summary is logged."""
+    return os.environ.get("PA_AGENT_DUMP_PROMPT", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _log_prompt_summary(log: logging.Logger, stage: str, messages: list[dict[str, Any]]) -> None:
+    """Log a one-line prompt summary; dump the full content only when PA_AGENT_DUMP_PROMPT=1.
+
+    The full prompt can be tens of thousands of tokens (~10k lines), so logging it
+    unconditionally floods the rotating file log and buries useful INFO records.
+    """
+    parts: list[str] = []
+    total = 0
+    for msg in messages:
+        role = str(msg.get("role", "?")).lower()
+        n = len(str(msg.get("content", "") or ""))
+        total += n
+        parts.append(f"{role}:{n}")
+    log.debug("【%s 发送的 Prompt】msgs=[%s] total_chars=%d", stage, ", ".join(parts), total)
+    if _prompt_dump_enabled():
+        for msg in messages:
+            role = str(msg.get("role", "?")).upper()
+            log.debug("\n--- [%s] ---\n%s", role, msg.get("content", ""))
+
+
+def _log_ai_response(log: logging.Logger, stage: str, reply: Any) -> None:
+    """Log a compact AI-response summary; dump full content only when PA_AGENT_DUMP_PROMPT=1."""
+    content = getattr(reply, "content", "") or ""
+    reasoning = getattr(reply, "reasoning_content", "") or ""
+    usage = getattr(reply, "usage", None)
+    log.debug(
+        "【%s AI 响应】content_chars=%d reasoning_chars=%d prompt=%s completion=%s latency=%s",
+        stage,
+        len(content),
+        len(reasoning),
+        getattr(usage, "prompt_tokens", "?"),
+        getattr(usage, "completion_tokens", "?"),
+        _latency_ms_label(getattr(reply, "latency_ms", None)),
+    )
+    if _prompt_dump_enabled():
+        log.debug("\n--- [%s 响应内容] ---\n%s", stage, content)
+        if reasoning:
+            log.debug("\n--- [%s 思考过程] ---\n%s", stage, reasoning)
 
 # When the gateway buffers the full reply, emit pseudo-stream chunks to the UI.
 _FALLBACK_STREAM_CHUNK = 48
@@ -467,14 +513,7 @@ class TwoStageOrchestrator:
             messages_s1 = self._assembler.build_stage1(frame, analysis_mode=analysis_mode)
 
         # ── Step 5: Call AI for Stage 1 ───────────────────────────────────────
-        logger.debug("\n" + "="*80)
-        logger.debug("【Stage 1 发送的完整 Prompt】")
-        logger.debug("="*80)
-        for msg in messages_s1:
-            role = msg.get("role", "?").upper()
-            content = msg.get("content", "")
-            logger.debug("\n--- [%s] ---\n%s", role, content)
-        logger.debug("="*80 + "\n")
+        _log_prompt_summary(logger, "Stage 1", messages_s1)
 
         # Notify conversation tab of the prompt being sent
         if on_stage_prompt is not None and not self._glm_flash_lite():
@@ -612,19 +651,7 @@ class TwoStageOrchestrator:
                 return record
 
             # ── Step 7: Validate Stage 1 ──────────────────────────────────────────
-            logger.debug("\n" + "="*80)
-            logger.debug("【Stage 1 AI 完整响应】")
-            logger.debug("="*80)
-            logger.debug(reply_s1.content)
-            if reply_s1.reasoning_content:
-                logger.debug("\n--- [思考过程] ---\n%s", reply_s1.reasoning_content)
-            logger.debug(
-                "\n--- [Token 用量] prompt=%s completion=%s latency=%s ---",
-                reply_s1.usage.prompt_tokens,
-                reply_s1.usage.completion_tokens,
-                _latency_ms_label(reply_s1.latency_ms),
-            )
-            logger.debug("="*80 + "\n")
+            _log_ai_response(logger, "Stage 1", reply_s1)
 
             s1_usage_calls = [getattr(reply_s1, "usage", None)]
 
@@ -896,14 +923,7 @@ class TwoStageOrchestrator:
             )
 
         # ── Step 15: Call AI for Stage 2 ──────────────────────────────────────
-        logger.debug("\n" + "="*80)
-        logger.debug("【Stage 2 发送的完整 Prompt】")
-        logger.debug("="*80)
-        for msg in messages_s2:
-            role = msg.get("role", "?").upper()
-            content = msg.get("content", "")
-            logger.debug("\n--- [%s] ---\n%s", role, content)
-        logger.debug("="*80 + "\n")
+        _log_prompt_summary(logger, "Stage 2", messages_s2)
 
         # Notify conversation tab of the prompt being sent
         if on_stage_prompt is not None and not self._glm_flash_lite():
@@ -1046,19 +1066,7 @@ class TwoStageOrchestrator:
                 return record
 
             # ── Step 17: Validate Stage 2 ─────────────────────────────────────────
-            logger.debug("\n" + "="*80)
-            logger.debug("【Stage 2 AI 完整响应】")
-            logger.debug("="*80)
-            logger.debug(reply_s2.content)
-            if reply_s2.reasoning_content:
-                logger.debug("\n--- [思考过程] ---\n%s", reply_s2.reasoning_content)
-            logger.debug(
-                "\n--- [Token 用量] prompt=%s completion=%s latency=%s ---",
-                reply_s2.usage.prompt_tokens,
-                reply_s2.usage.completion_tokens,
-                _latency_ms_label(reply_s2.latency_ms),
-            )
-            logger.debug("="*80 + "\n")
+            _log_ai_response(logger, "Stage 2", reply_s2)
 
             s2_usage_calls = [getattr(reply_s2, "usage", None)]
 
@@ -1614,6 +1622,7 @@ class TwoStageOrchestrator:
             list(getattr(self._settings.provider, "fallbacks", []) or [])
             if self._settings is not None else []
         )
+        transient_attempt = 0
         while True:
             lite = self._glm_flash_lite()
             if lite:
@@ -1715,6 +1724,30 @@ class TwoStageOrchestrator:
                         exc,
                     )
                 else:
+                    # No provider/openclaw fallback applicable: bounded exponential
+                    # backoff for transient rate-limit / server / timeout errors
+                    # (e.g. HTTP 429), spanning several quota windows.
+                    if (
+                        transient_attempt < self._MAX_TRANSIENT_RETRIES
+                        and self._is_retryable_transient(exc)
+                    ):
+                        transient_attempt += 1
+                        delay = self._transient_backoff_seconds(exc, transient_attempt)
+                        if self._settings is None:
+                            delay = 0.0  # tests/mocks: no real quota, retry immediately
+                        logger.warning(
+                            "%s transient error (%s); backoff %.1fs then retry %d/%d",
+                            stage_label,
+                            exc,
+                            delay,
+                            transient_attempt,
+                            self._MAX_TRANSIENT_RETRIES,
+                        )
+                        if cancel_token.wait(delay):
+                            from pa_agent.ai.deepseek_client import CancelledError
+
+                            raise CancelledError("Request cancelled during backoff")
+                        continue
                     raise last_provider_exc or exc
 
     def _try_next_provider_fallback(
@@ -1886,6 +1919,45 @@ class TwoStageOrchestrator:
             self._settings.provider.base_url,
         )
         return True
+
+    # Backoff spans multiple ~60s quota windows so transient 429s recover instead
+    # of losing the whole decision (total added wait ~155s across 5 retries).
+    _TRANSIENT_BACKOFF_SCHEDULE = (5.0, 15.0, 30.0, 45.0, 60.0)
+    _MAX_TRANSIENT_RETRIES = len(_TRANSIENT_BACKOFF_SCHEDULE)
+
+    @staticmethod
+    def _http_status_code(exc: Exception) -> int | None:
+        """Best-effort extraction of an HTTP status code from an SDK/httpx error."""
+        code = getattr(exc, "status_code", None)
+        if code is None:
+            code = getattr(getattr(exc, "response", None), "status_code", None)
+        try:
+            return int(code) if code is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _is_retryable_transient(cls, exc: Exception) -> bool:
+        """True for errors worth retrying (rate limit / 5xx / timeout), not bad requests."""
+        code = cls._http_status_code(exc)
+        if code is not None:
+            return code in (408, 409, 425, 429, 500, 502, 503, 504)
+        return cls._is_network_error(exc)
+
+    @classmethod
+    def _transient_backoff_seconds(cls, exc: Exception, attempt: int) -> float:
+        """Window-aware backoff: schedule step, extended by a larger Retry-After."""
+        schedule = cls._TRANSIENT_BACKOFF_SCHEDULE
+        base = schedule[min(attempt - 1, len(schedule) - 1)]
+        headers = getattr(getattr(exc, "response", None), "headers", None)
+        if headers is not None:
+            retry_after = headers.get("retry-after")
+            if retry_after:
+                try:
+                    base = max(base, min(float(retry_after), 60.0))
+                except (TypeError, ValueError):
+                    pass
+        return base
 
     @staticmethod
     def _is_network_error(exc: Exception) -> bool:

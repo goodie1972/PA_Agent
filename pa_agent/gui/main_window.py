@@ -2461,6 +2461,17 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             logger.debug("_refresh_keep_analysis_sentinel error: %s", exc)
 
+    def _throttle_keep_log(self, message: str, *, warning: bool = False) -> None:
+        """Throttle per-tick keep-analysis logs to a state change or once per minute."""
+        import time as _time
+
+        now = _time.monotonic()
+        last = getattr(self, "_keep_skip_log", None)
+        level = logging.WARNING if warning else logging.DEBUG
+        if last is None or last[0] != message or (now - last[1]) >= 60.0:
+            logger.log(level, message)
+            self._keep_skip_log = (message, now)
+
     def _check_keep_analysis(self, bars: Any) -> None:
         """Trigger a new analysis round when keep-analysis is enabled and a new bar has closed.
 
@@ -2474,15 +2485,18 @@ class MainWindow(QMainWindow):
         if not self._keep_analysis_checkbox.isChecked():
             return
         if self._analysis_in_progress:
-            logger.debug("持续跟踪分析：跳过（分析进行中）")
+            self._throttle_keep_log("持续跟踪分析：跳过（分析进行中）")
             return
         if self._pending_submit_after_close:
-            logger.debug("持续跟踪分析：跳过（等待K线收盘中）")
+            self._throttle_keep_log("持续跟踪分析：跳过（等待K线收盘中）")
             return
         if getattr(self, "_demo_mode", False):
             return
         if not bars or len(bars) < 2:
-            logger.warning("持续跟踪分析：跳过（bars 数量不足，len=%d）", len(bars) if bars else 0)
+            self._throttle_keep_log(
+                f"持续跟踪分析：跳过（bars 数量不足，len={len(bars) if bars else 0}）",
+                warning=True,
+            )
             return
 
         try:
@@ -2541,7 +2555,7 @@ class MainWindow(QMainWindow):
                 return
 
             if closed_ts == self._keep_analysis_last_closed_ts:
-                logger.debug("持续跟踪分析：无新K线（sentinel=%s）", closed_ts)
+                self._throttle_keep_log(f"持续跟踪分析：无新K线（sentinel={closed_ts}）")
                 return  # No new bar yet
 
             # New bar has closed — update sentinel and trigger analysis

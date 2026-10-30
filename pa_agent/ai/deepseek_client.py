@@ -229,7 +229,11 @@ _DEEPSEEK_MAX_OUTPUT_TOKENS = 393_216
 # Global gateway hard cap observed on several OpenAI-compatible proxies (incl. SenseNova).
 _GLOBAL_MAX_OUTPUT_TOKENS = 384_000
 _SENSENOVA_GLM_MAX_OUTPUT_TOKENS = 131_072
-_SENSENOVA_DEFAULT_MAX_OUTPUT_TOKENS = 65_536
+# Model allows 65536 output tokens, but the two-stage analysis only emits ~2-4k
+# tokens of JSON. Requesting the model max makes the gateway reserve (and count
+# toward the per-minute quota) far more than is used, which trips 429 "rpm
+# exhausted" on the second (Stage 2) request. Cap at 16k — ample headroom.
+_SENSENOVA_DEFAULT_MAX_OUTPUT_TOKENS = 16_384
 # B.AI (api.b.ai) 网关：deepseek-v4-flash 的 completion 上限（官方路由配 8192）。
 # 超过此值 B.AI 会返回 400，因此单独限流。
 _BAI_MAX_OUTPUT_TOKENS = 8_192
